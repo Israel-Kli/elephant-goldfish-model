@@ -15,7 +15,7 @@
 # Run the Tier 1 unit tests (frontmatter schema, relative link integrity,
 # scenario coverage, eval runner) described in TESTING.md. They are offline and
 # need no API keys or model dependencies.
-name: Tests
+name: Run tests
 
 on:
   pull_request:
@@ -38,6 +38,7 @@ jobs:
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: '3.12'
-      - run: pip install pytest==8.3.5 pyyaml==6.0.2
+      - run: python -m pip install --upgrade "pip>=25.1"
+      - run: python -m pip install --group test
       - run: python -m pytest tests/unit
         shell: bash
