@@ -61,6 +61,7 @@ def role(request: dict[str, Any]) -> str:
 class MockProvider(BaseHTTPRequestHandler):
     persona = ''
     fixture = ''
+    skip_persona = False
 
     def log_message(self, _format: str, *_args: object) -> None:
         pass
@@ -79,7 +80,8 @@ class MockProvider(BaseHTTPRequestHandler):
                 'prompt': CHILD_PROMPT,
             })]
         elif role(request) == 'child':
-            steps = [('read', {'path': self.persona}), ('read', {'path': self.fixture})]
+            steps = [] if self.skip_persona else [('read', {'path': self.persona})]
+            steps.append(('read', {'path': self.fixture}))
             if 'skill' in tools:
                 steps += [('skill', {'id': skill}) for skill in SKILLS]
         delta = {'role': 'assistant', 'content': 'SCRIPTED_COMPLETION'}
@@ -178,6 +180,8 @@ def main() -> None:
     parser.add_argument('--source', type=Path, required=True)
     parser.add_argument('--opencode', type=Path, required=True)
     parser.add_argument('--output', type=Path, required=True)
+    parser.add_argument('--plugin', type=Path, help='plugin directory to load, such as adapters/opencode/plugin')
+    parser.add_argument('--skip-persona-read', action='store_true', help='script the reviewer to skip its persona')
     args = parser.parse_args()
     source, binary = args.source.resolve(), args.opencode.resolve()
     version = subprocess.check_output([str(binary), '--version'], text=True).strip()
@@ -202,10 +206,22 @@ def main() -> None:
             global_config = home / 'config' / 'opencode'
             global_config.mkdir(parents=True)
             (global_config / 'AGENTS.md').write_text(f'Global rule: {GLOBAL_RULE}\n')
-            # The installer's configuration stays unchanged in OPENCODE_CONFIG;
-            # the test-only provider is a separate global document in the 2.x format.
+            subprocess.run(
+                ['python3', '-I', str(source / 'adapters/opencode/install.py'), str(install)],
+                check=True, stdout=subprocess.DEVNULL, timeout=60,
+            )
+            persona = install / 'bundle' / 'agents' / PERSONA
+            MockProvider.persona, MockProvider.fixture = str(persona), str(project / '.env')
+            MockProvider.skip_persona = args.skip_persona_read
+            plugins = [{
+                'package': str(args.plugin.resolve()),
+                'options': {'required': {REVIEWER: [str(persona)]}},
+            }] if args.plugin else []
+            # The installer's configuration stays unchanged in OPENCODE_CONFIG; the test-only
+            # provider and plugin are a separate global document in the 2.x format.
             (global_config / 'opencode.json').write_text(json.dumps({
                 '$schema': 'https://opencode.ai/config.json',
+                'plugins': plugins,
                 'model': 'fixture/fixture',
                 'providers': {'fixture': {
                     'name': 'fixture',
@@ -217,12 +233,6 @@ def main() -> None:
                     'models': {'fixture': {'name': 'fixture'}},
                 }},
             }, indent=2) + '\n')
-            subprocess.run(
-                ['python3', '-I', str(source / 'adapters/opencode/install.py'), str(install)],
-                check=True, stdout=subprocess.DEVNULL, timeout=60,
-            )
-            persona = install / 'bundle' / 'agents' / PERSONA
-            MockProvider.persona, MockProvider.fixture = str(persona), str(project / '.env')
             shutil.copy2(install / 'opencode.json', args.output / 'candidate-opencode.json')
             shutil.copy2(global_config / 'opencode.json', args.output / 'test-provider-opencode.json')
             env = {
@@ -294,6 +304,8 @@ def main() -> None:
                 'opencode_version': version,
                 'model': 'scripted local mock',
                 'command': ['opencode', *command, '--standalone'],
+                'plugin': str(args.plugin) if args.plugin else None,
+                'skip_persona_read': args.skip_persona_read,
                 'checks': checks,
                 'observations': {
                     'subagent_input': call['input'],
@@ -302,9 +314,19 @@ def main() -> None:
                     'child_skill_calls': skill_calls,
                     'project_agents_md_in_child': any(PROJECT_RULE in json.dumps(r) for r in children),
                     'global_agents_md_in_child': any(GLOBAL_RULE in json.dumps(r) for r in children),
+                    'agents_md_in_parent': any(
+                        PROJECT_RULE in json.dumps(r) and GLOBAL_RULE in json.dumps(r) for r in parents
+                    ),
+                    'date_and_env_in_child': bool(children) and all(
+                        "Today's date: " in json.dumps(r) and 'Working directory: ' in json.dumps(r) for r in children
+                    ),
+                    'incomplete_review_flagged': any(
+                        'EGM: incomplete review' in json.dumps(m.get('content'))
+                        for r in parents for m in r['messages'] if m.get('role') == 'tool'
+                    ),
                 },
                 'scope': (
-                    'One scripted delegation, two reads and any skill calls; not full '
+                    'One scripted delegation, up to two reads and any skill calls; not full '
                     'workflow, model behavior, or general isolation'
                 ),
             }
