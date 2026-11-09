@@ -1,58 +1,109 @@
 // Copyright 2026 Google LLC.
 // SPDX-License-Identifier: Apache-2.0
 
-// Experimental OpenCode 2.x spike for #282, not wired into the installer. It keeps inherited
-// instructions and the skill tool away from EGM reviewers, and flags a reviewer result whose
-// required reads did not complete. Options: { required: { "<reviewer>": ["<absolute path>"] } }.
+// Server plugin for the experimental OpenCode V2 adapter (#282). The installer passes
+// { primary: "egm", bundle: "<bundle root>", reviewers: { "<agent ID>": ["<required absolute path>", ...] } }.
 
-type Part = { type: string; text?: string }
+type Part = { type: string; text?: string; metadata?: any }
 
-const isReviewer = (agent: string | undefined) => !!agent && agent.startsWith("egm-")
+// Reviewers keep only these host instruction sources. core/instructions carries every
+// AGENTS.md and configured instruction file; Code Mode, MCP and skill guidance are parent context.
+const KEEP = new Set(["core/date", "core/environment"])
+const REVIEWER_TOOLS = new Set(["read", "glob"])
 
-// OpenCode renders each instruction source as "Instructions from: <source>" plus its content,
-// in the same system part as the date and the <env> block, which reviewers still need.
-const INSTRUCTION_BLOCK = /Instructions from: [^\n]*\n[\s\S]*?(?:\n\n\n|$)(?=Instructions from: |Today's date: |$)/g
+const normalize = (path: unknown) => (typeof path === "string" ? path.replace(/\/+/g, "/") : "")
+
+// Mirrors the installer's ordered read rules: deny *.env and *.env.*, then allow *.env.example.
+const secret = (resource: string) => /\.env($|\.)/.test(resource) && !/\.env\.example$/.test(resource)
 
 const completedReads = (messages: any[]) =>
   new Set(
     messages
       .filter((message) => message.type === "assistant")
       .flatMap((message) => message.content ?? [])
-      .filter((part) => part.type === "tool" && part.name === "read" && part.state?.status === "completed")
-      .map((part) => part.state.input?.path),
+      .filter(
+        (part) =>
+          part.type === "tool" &&
+          part.name === "read" &&
+          part.state?.status === "completed" &&
+          JSON.stringify(part.state.content ?? "").trim().length > 2,
+      )
+      .map((part) => normalize(part.state.input?.path)),
   )
 
 export default {
-  id: "egm-reviewer-guard",
+  id: "egm-guard",
   async setup(ctx: any) {
-    const required: Record<string, string[]> = ctx.options?.required ?? {}
+    const primary: string = ctx.options?.primary ?? "egm"
+    const bundle: string = ctx.options?.bundle
+    const reviewers: Record<string, string[]> = ctx.options?.reviewers ?? {}
+    const isReviewer = (agent: unknown): agent is string => typeof agent === "string" && Object.hasOwn(reviewers, agent)
 
-    await ctx.session.hook("context", (event: any) => {
+    const isolate = async (event: any) => {
       if (!isReviewer(event.agent)) return
-      event.system = event.system
-        .map((part: Part) =>
-          part.type === "text" && part.text ? { ...part, text: part.text.replace(INSTRUCTION_BLOCK, "") } : part,
-        )
-        .filter((part: Part) => part.type !== "text" || part.text)
-      delete event.tools.skill
+      event.system = (event.system ?? []).flatMap((part: Part) => {
+        const sources = part.metadata?.experimental?.instructions
+        if (Array.isArray(sources)) {
+          const kept = sources.filter((source: any) => KEEP.has(source.key)).map((source: any) => source.text)
+          return kept.length ? [{ ...part, text: kept.join("\n\n") }] : []
+        }
+        // Without source metadata an instruction block cannot be told apart from host text.
+        return part.text?.includes("Instructions from: ") ? [] : [part]
+      })
+      // Nested AGENTS.md files arrive as synthetic messages after a read below them.
+      const history = await ctx.session.context({ sessionID: event.sessionID })
+      const injected = new Set(
+        history.filter((message: any) => message.type === "synthetic" && message.metadata?.instruction).map((message: any) => message.id),
+      )
+      event.messages = (event.messages ?? []).filter((message: any) => !injected.has(message.id))
+      for (const tool of Object.keys(event.tools ?? {})) if (!REVIEWER_TOOLS.has(tool)) delete event.tools[tool]
+    }
+    await ctx.session.hook("context", isolate)
+    await ctx.session.hook("compaction", isolate)
+
+    // Every review is a fresh foreground child: never resume a reviewer session.
+    await ctx.tool.hook("execute.before", (event: any) => {
+      if (event.tool !== "subagent" || event.agent !== primary || !isReviewer(event.input?.agent)) return
+      const { sessionID: _session, background: _background, ...input } = event.input
+      event.input = input
     })
 
     await ctx.tool.hook("execute.after", async (event: any) => {
-      if (event.tool !== "subagent" || event.status !== "completed") return
+      if (event.tool !== "subagent" || event.agent !== primary || event.status !== "completed") return
       const agent = event.input?.agent
-      const paths = required[agent]
+      if (!isReviewer(agent)) return
       const child = event.result?.metadata?.sessionID
-      if (!paths?.length || !child) return
-      const reads = completedReads(await ctx.session.context({ sessionID: child }))
-      const missing = paths.filter((path) => !reads.has(path))
+      const reads = child ? completedReads(await ctx.session.context({ sessionID: child })) : new Set<string>()
+      const missing = reviewers[agent].filter((path) => !reads.has(normalize(path)))
       if (!missing.length) return
       const notice =
         `EGM: incomplete review. ${agent} did not complete required reads: ${missing.join(", ")}. ` +
-        "Treat this review as incomplete and do not use its findings."
+        "Do not use this review; report it as incomplete."
       event.result = {
         ...event.result,
-        content: [{ type: "text", text: notice }, ...(event.result.content ?? [])],
-        metadata: { ...event.result.metadata, egmMissingReads: missing },
+        content: [{ type: "text", text: notice }],
+        metadata: { ...event.result?.metadata, egmMissingReads: missing },
+      }
+    })
+
+    // Project config and session rules can append allows after the installer's reviewer rules;
+    // configured denies never reach this hook, so it only tightens.
+    await ctx.permission.hook("evaluate", (event: any) => {
+      const resources: string[] = event.resources ?? []
+      if (isReviewer(event.agent)) {
+        const permitted =
+          event.action === "glob" ||
+          (event.action === "read" && !resources.some(secret)) ||
+          (event.action === "external_directory" && resources.every((resource) => resource.startsWith(`${bundle}/`)))
+        if (!permitted) {
+          event.effect = "deny"
+          event.message = "EGM reviewers may only read the project and the EGM bundle."
+        }
+        return
+      }
+      // The installer sets reviewer dispatch to "ask", so a missing plugin surfaces as a prompt.
+      if (event.action === "subagent" && event.agent === primary && event.effect === "ask" && resources.length && resources.every(isReviewer)) {
+        event.effect = "allow"
       }
     })
   },
