@@ -95,6 +95,55 @@ def test_stage_required_reports_preserve_context_boundary(tmp_path: Path) -> Non
     assert "Do not pass parent history, private reasoning, or memory." in guide
 
 
+def test_v2_install_uses_native_config_and_guard(tmp_path: Path) -> None:
+    destination = tmp_path / "candidate"
+    config_path = ADAPTER["install"](destination, "v2")
+    config = json.loads(config_path.read_text())
+    identity = json.loads((destination / "installation.json").read_text())
+    bundle = destination / "bundle"
+    assert (identity["host_version"], identity["interface"]) == (ADAPTER["V2_HOST_VERSION"], "v2")
+    assert identity["config_sha256"] == hashlib.sha256(config_path.read_bytes()).hexdigest()
+    assert "plugin/index.ts" in identity["sha256"]
+    for relative, digest in identity["sha256"].items():
+        assert hashlib.sha256((destination / relative).read_bytes()).hexdigest() == digest
+    # Keys from the V1 schema would mix formats inside one document.
+    assert not {"agent", "command", "autoupdate", "permission"} & set(config)
+    assert config["skills"] == [str(destination / "skills")]
+
+    personas = {
+        ADAPTER["name"](bundle / "agents" / f"{filename}.md"): str(bundle / "agents" / f"{filename}.md")
+        for filename in ADAPTER["REVIEWERS"]
+    }
+    [plugin] = config["plugins"]
+    assert plugin == {
+        "package": str(destination / "plugin"),
+        "options": {"primary": "egm", "bundle": str(bundle), "reviewers": personas},
+    }
+    assert set(config["agents"]) == {"egm", *personas}
+    for key, persona in personas.items():
+        agent = config["agents"][key]
+        assert agent["mode"] == "subagent"
+        assert persona in agent["system"]
+        assert [(r["action"], r["resource"], r["effect"]) for r in agent["permissions"]] == [
+            ("*", "*", "deny"),
+            ("read", "*", "allow"), ("read", "*.env", "deny"), ("read", "*.env.*", "deny"),
+            ("read", "*.env.example", "allow"),
+            ("glob", "*", "allow"),
+            ("external_directory", "*", "deny"), ("external_directory", f"{bundle}/*", "allow"),
+        ]
+    primary = config["agents"]["egm"]
+    # Only the guard plugin grants reviewer dispatch, so it stays denied in the config.
+    assert [(r["resource"], r["effect"]) for r in primary["permissions"] if r["action"] == "subagent"] == [
+        ("*", "deny"), *((key, "deny") for key in personas),
+    ]
+    assert "EGM required reads:" in primary["system"]
+    for command in config["commands"].values():
+        assert command["agent"] == "egm"
+        assert str(bundle / "docs/opencode_v2.md") in command["template"]
+    with pytest.raises(ValueError, match="interface"):
+        ADAPTER["install"](tmp_path / "other", "v3")
+
+
 def test_existing_destination_is_untouched(tmp_path: Path) -> None:
     sentinel = tmp_path / "existing.txt"
     sentinel.write_text("other worker")

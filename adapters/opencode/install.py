@@ -104,6 +104,9 @@ def install(destination: Path, interface: str = "v1") -> Path:
         host_version, extra, owned = V2_HOST_VERSION, {"interface": "v2"}, [bundle, plugin]
     config_path = destination / "opencode.json"
     config_path.write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
+    if interface == "v2":
+        # The plugin entry and reviewer rules live in the config, so evidence must identify it too.
+        extra["config_sha256"] = hashlib.sha256(config_path.read_bytes()).hexdigest()
     metadata = json.loads((bundle / "plugin.json").read_text(encoding="utf-8"))
     (destination / "installation.json").write_text(json.dumps({
         "name": metadata["name"], "version": metadata["version"],
@@ -181,7 +184,9 @@ def v2_config(bundle, skills, plugin, commands, personas, location, reviewer_pro
                 ("glob", "*", "allow"),
                 ("external_directory", "*", "deny"), ("external_directory", f"{bundle}/*", "allow"),
             ),
-            "system": location + reviewer_prompt.format(persona=persona),
+            "system": location + reviewer_prompt.format(persona=persona)
+            + " Read the persona and every file listed under \"EGM required reads\" in your task in full; "
+            "when a read is truncated, continue from the offset it gives until the end of the file.",
         }
     agents["egm"] = {
         "description": "EGM orchestrator (experimental OpenCode V2)",
@@ -193,8 +198,9 @@ def v2_config(bundle, skills, plugin, commands, personas, location, reviewer_pro
             ("read", "*.env.example", "allow"),
             ("glob", "*", "allow"), ("grep", "*", "allow"), ("question", "*", "allow"),
             ("skill", "*", "deny"), ("skill", "egm-*", "allow"),
-            # "ask", not "allow": the guard plugin allows these, so a missing plugin shows a prompt.
-            ("subagent", "*", "deny"), *(("subagent", key, "ask") for key in personas),
+            # The guard plugin grants each reviewer dispatch as a session rule; without it, none starts.
+            # The per-reviewer denies keep OpenCode 2.2.6 from dropping the subagent tool altogether.
+            ("subagent", "*", "deny"), *(("subagent", key, "deny") for key in personas),
             ("external_directory", "*", "ask"), ("external_directory", f"{bundle}/*", "allow"),
         ),
         "system": f"Read {bundle / 'docs/opencode_v2.md'} first. " + location
@@ -202,7 +208,10 @@ def v2_config(bundle, skills, plugin, commands, personas, location, reviewer_pro
         "set agent to the registered persona name and supply description and prompt. "
         "Never pass sessionID or background; every review starts a fresh foreground child session. "
         "Pass only the task, absolute resource paths, target, standards, and selected reading list, "
-        "not conversation history. Stop if delegation or a required completion is missing, "
+        "not conversation history. End every reviewer prompt with a line \"EGM required reads:\" "
+        "followed by one \"- <absolute path>\" line for each file the canonical stage requires that "
+        "reviewer to read: the target, standards, and any supplied report. Do not list the persona. "
+        "Stop if delegation or a required completion is missing, "
         "or if a reviewer result starts with \"EGM: incomplete review\". " + stages,
     }
     return {
@@ -215,7 +224,7 @@ def v2_config(bundle, skills, plugin, commands, personas, location, reviewer_pro
             "options": {
                 "primary": "egm",
                 "bundle": str(bundle),
-                "reviewers": {key: [str(persona)] for key, (_, persona) in personas.items()},
+                "reviewers": {key: str(persona) for key, (_, persona) in personas.items()},
             },
         }],
         "agents": agents,
