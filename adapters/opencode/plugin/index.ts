@@ -7,7 +7,7 @@
 // so without the plugin no reviewer can start.
 
 import { readFileSync, realpathSync } from "node:fs"
-import { isAbsolute, join, relative, sep } from "node:path"
+import { isAbsolute, relative, resolve as resolvePath, sep } from "node:path"
 
 type Part = { type: string; text?: string; metadata?: any }
 type Rule = { action: string; resource: string; effect: string }
@@ -26,10 +26,12 @@ const real = (path: string) => {
   }
 }
 const within = (path: string, root: string) => path === root || path.startsWith(root + sep)
-// Mirrors the installer's ordered read rules: deny *.env and *.env.*, then allow *.env.example.
-const secret = (path: string) => /\.env($|\.)/.test(path) && !/\.env\.example$/.test(path)
+// The installer's read rules deny *.env and *.env.*, then allow *.env.example. Matching ignores
+// case here because macOS and Windows file systems usually do.
+const secret = (path: string) => /\.env($|\.)/i.test(path) && !/\.env\.example$/i.test(path)
 
-// OpenCode 2.2.6 starts read output with "Read file <path>, lines A-B" or "Read file <path>, 0 lines".
+// OpenCode 2.2.6 starts read output with "Read file <path>, lines A-B", counting only the lines
+// it returned, or "Read file <path>, 0 lines".
 const readRange = (text: string): [number, number] | undefined => {
   const match = /, lines (\d+)-(\d+)$/.exec(text.split("\n", 1)[0])
   return match ? [Number(match[1]), Number(match[2])] : undefined
@@ -55,14 +57,17 @@ const covers = (ranges: [number, number][], total: number) => {
   return next > total
 }
 
-// "- /absolute/path" lines directly after the last "EGM required reads:" line.
+// Bullets after the last "EGM required reads:" header; models often add Markdown emphasis
+// to the header and code spans or quotes to paths. An empty list is valid.
 const declaredReads = (prompt: unknown) => {
   const text = String(prompt ?? "")
   const at = text.lastIndexOf(READS_HEADER)
-  if (at < 0) return []
+  const [rest, ...lines] = at < 0 ? [""] : text.slice(at + READS_HEADER.length).split("\n")
+  if (at < 0 || !/^[*_\s]*$/.test(rest)) return undefined
   const paths: string[] = []
-  for (const line of text.slice(at + READS_HEADER.length).split("\n").map((value) => value.trim())) {
-    if (line.startsWith("- ")) paths.push(line.slice(2).trim())
+  for (const line of lines.map((value) => value.trim())) {
+    const bullet = /^[-*]\s+[`"']?(.+?)[`"']?$/.exec(line)
+    if (bullet) paths.push(bullet[1].trim())
     else if (line || paths.length) break
   }
   return paths
@@ -102,7 +107,16 @@ export default {
         (root): root is string => !!root,
       )
     }
-    const resolve = (path: string, directory: string) => (isAbsolute(path) ? path : join(directory, path))
+    const resolve = (path: string, directory: string) => resolvePath(directory, path)
+    // Checks the file a path resolves to, so symlinks cannot reach .env files or leave the roots.
+    const allowedFile = (requested: string, directory: string, roots: string[]) => {
+      if (secret(relative(directory, requested))) return false
+      const target = real(requested)
+      // A missing file cannot leak; the read itself reports it.
+      if (!target) return true
+      const root = roots.find((candidate) => within(target, candidate))
+      return !!root && !secret(relative(root, target))
+    }
 
     const isolate = (strict: boolean) => async (event: any) => {
       if (!isReviewer(event.agent)) return
@@ -124,6 +138,7 @@ export default {
       event.messages = (event.messages ?? []).filter((message: any) => !synthetic.has(message.id))
       for (const tool of Object.keys(event.tools ?? {})) if (!REVIEWER_TOOLS.has(tool)) delete event.tools[tool]
     }
+
     // Per-dispatch grants as session rules (sessionID -> tool call ID -> reviewer). Updates are
     // serialized because reviewers run concurrently.
     const live = new Map<string, Map<string, string>>()
@@ -157,13 +172,29 @@ export default {
     await ctx.session.hook("generate", isolate(false))
 
     await ctx.tool.hook("execute.before", async (event: any) => {
+      // glob permissions see only the pattern, so a path through a project symlink would list outside files.
+      if (isReviewer(event.agent) && event.tool === "glob" && event.input?.path !== undefined) {
+        const directory = await directoryOf(event.sessionID)
+        const target = real(resolve(String(event.input.path), directory))
+        if (!target || !(await rootsOf(event.sessionID)).some((root) => within(target, root))) {
+          throw new Error("EGM: reviewers may only glob inside the project and the EGM bundle")
+        }
+      }
       if (event.tool !== "subagent" || event.agent !== primary || !isReviewer(event.input?.agent)) return
       const reads = declaredReads(event.input.prompt)
-      if (!reads.length || reads.some((path) => !isAbsolute(path))) {
+      if (!reads || reads.some((path) => !isAbsolute(path))) {
         throw new Error(
           `EGM: end the reviewer prompt with "${READS_HEADER}" followed by one "- <absolute path>" line for each file ` +
-            "the stage requires the reviewer to read (target, standards, supplied reports).",
+            "the stage requires the reviewer to read (target, standards, supplied reports); leave the list empty if there are none.",
         )
+      }
+      // Fail before the reviewer runs rather than report an incomplete review afterwards.
+      const directory = await directoryOf(event.sessionID)
+      const roots = await rootsOf(event.sessionID)
+      for (const path of reads) {
+        if (!real(path) || !allowedFile(path, directory, roots) || lineCount(path) === 0) {
+          throw new Error(`EGM: required read is missing, empty, or outside the project and the EGM bundle: ${path}`)
+        }
       }
       // Every review is a fresh foreground child: never resume a reviewer session.
       const { sessionID: _session, background: _background, ...input } = event.input
@@ -193,12 +224,12 @@ export default {
           }
         }
       }
-      const missing = [reviewers[agent], ...declaredReads(event.input.prompt)].filter((path: string) => {
-        const target = real(path)
-        if (!target) return true
+      // The orchestrator may list the persona too; report each file once.
+      const required = new Map([reviewers[agent], ...(declaredReads(event.input.prompt) ?? [])].map((path) => [real(path) ?? path, path]))
+      const missing = [...required].filter(([target]) => {
         const total = lineCount(target)
         return total === 0 || !covers(ranges.get(target) ?? [], total)
-      })
+      }).map(([, path]) => path)
       if (!missing.length) return
       const notice =
         `EGM: incomplete review. ${agent} did not read these required files in full: ${missing.join(", ")}. ` +
@@ -232,14 +263,7 @@ export default {
       if (event.action === "read") {
         const directory = await directoryOf(event.sessionID)
         const roots = await rootsOf(event.sessionID)
-        permitted = resources.every((resource) => {
-          const requested = resolve(resource, directory)
-          const target = real(requested)
-          // A missing file cannot leak; the read itself reports it.
-          if (!target) return !secret(relative(directory, requested))
-          const root = roots.find((candidate) => within(target, candidate))
-          return !!root && !secret(relative(directory, requested)) && !secret(relative(root, target))
-        })
+        permitted = resources.every((resource) => allowedFile(resolve(resource, directory), directory, roots))
       }
       if (!permitted) {
         event.effect = "deny"

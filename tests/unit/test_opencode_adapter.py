@@ -131,6 +131,11 @@ def test_v2_install_uses_native_config_and_guard(tmp_path: Path) -> None:
             ("glob", "*", "allow"),
             ("external_directory", "*", "deny"), ("external_directory", f"{bundle}/*", "allow"),
         ]
+    guide = " ".join((bundle / "docs/opencode_v2.md").read_text().split())
+    for instructions in (config["agents"]["egm-zoom-out"]["system"], guide):
+        assert "Read prior reports only when explicitly supplied and required by the canonical stage." in instructions
+        assert "Do not retrieve unsolicited history, memory, or earlier reviewer findings." in instructions
+    assert "Do not pass parent history, private reasoning, or memory." in guide
     primary = config["agents"]["egm"]
     # Only the guard plugin grants reviewer dispatch, so it stays denied in the config.
     assert [(r["resource"], r["effect"]) for r in primary["permissions"] if r["action"] == "subagent"] == [

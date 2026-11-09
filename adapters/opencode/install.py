@@ -184,9 +184,11 @@ def v2_config(bundle, skills, plugin, commands, personas, location, reviewer_pro
                 ("glob", "*", "allow"),
                 ("external_directory", "*", "deny"), ("external_directory", f"{bundle}/*", "allow"),
             ),
+            # The guard checks that each required file was read in full, so a line-range scope
+            # must not turn into a partial read.
             "system": location + reviewer_prompt.format(persona=persona)
-            + " Read the persona and every file listed under \"EGM required reads\" in your task in full; "
-            "when a read is truncated, continue from the offset it gives until the end of the file.",
+            + " Read the persona and every file listed under \"EGM required reads\" from line 1 to the end, "
+            "even when your review scope is a line range; pass offset only to continue after a truncated page.",
         }
     agents["egm"] = {
         "description": "EGM orchestrator (experimental OpenCode V2)",
@@ -211,7 +213,8 @@ def v2_config(bundle, skills, plugin, commands, personas, location, reviewer_pro
         "not conversation history. End every reviewer prompt with a line \"EGM required reads:\" "
         "followed by one \"- <absolute path>\" line for each file the canonical stage requires that "
         "reviewer to read: the target, standards, and any supplied report. Do not list the persona. "
-        "Stop if delegation or a required completion is missing, "
+        "Keep the line with an empty list when there is no such file, as in a brainstorm whose concept "
+        "is in the prompt. Stop if delegation or a required completion is missing, "
         "or if a reviewer result starts with \"EGM: incomplete review\". " + stages,
     }
     return {

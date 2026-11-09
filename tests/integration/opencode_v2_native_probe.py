@@ -46,6 +46,7 @@ class MockProvider(BaseHTTPRequestHandler):
     parent_steps: list[str] = []
     child_steps: list[tuple[str, dict[str, Any]]] = []
     dispatch: dict[str, Any] = {}
+    resume_dispatch: dict[str, Any] = {}
     calls = itertools.count(1)
     lock = threading.Lock()
 
@@ -88,9 +89,10 @@ class MockProvider(BaseHTTPRequestHandler):
     def parent_call(self, step: str, messages: list[dict[str, Any]]) -> tuple[str, dict[str, Any]]:
         if step == 'dispatch':
             return 'subagent', self.dispatch
-        # A resume attempt: reuse the first child's session in the background.
+        # A resume attempt, sent as a brainstorm dispatch: reuse the first child's session in the background.
         previous = re.findall(r'sessionID=\\?"(ses_[A-Za-z0-9]+)', json.dumps(messages))
-        return 'subagent', {**self.dispatch, 'sessionID': previous[-1] if previous else 'ses_missing', 'background': True}
+        return 'subagent', {**(self.resume_dispatch or self.dispatch),
+                            'sessionID': previous[-1] if previous else 'ses_missing', 'background': True}
 
 
 def role(request: dict[str, Any]) -> str:
@@ -188,6 +190,7 @@ def run(scenario: str, source: Path, binary: Path, output: Path, port: int) -> d
         (project / 'alias.md').symlink_to(project / '.env')
         (outside / 'private.md').write_text(markers['outside'] + '\n')
         (project / 'reference.md').symlink_to(outside / 'private.md')
+        (project / 'outside-dir').symlink_to(outside, target_is_directory=True)
         config_dir = home / 'config' / 'opencode'
         config_dir.mkdir(parents=True)
         (config_dir / 'AGENTS.md').write_text(f'Global rule: {markers["global"]}\n')
@@ -207,10 +210,16 @@ def run(scenario: str, source: Path, binary: Path, output: Path, port: int) -> d
         persona = install / 'bundle' / 'agents' / PERSONA
         standard = install / 'bundle' / STANDARD
         target = project / 'docs' / 'target.md'
-        reads = f'EGM required reads:\n- {target}\n- {standard}'
+        # Live models add Markdown to the header and paths, and sometimes list the persona anyway.
+        reads = f'**EGM required reads:**\n\n- `{persona}`\n- `{target}`\n- `{standard}`'
         MockProvider.dispatch = {
             'agent': REVIEWER, 'description': 'Probe reviewer',
             'prompt': f'Mode: REVIEW. Review {target}.' + ('' if scenario == 'undeclared' else f'\n\n{reads}'),
+        }
+        MockProvider.resume_dispatch = {
+            'agent': REVIEWER, 'description': 'Probe brainstorm reviewer',
+            # A brainstorm concept lives in the prompt, so its list of required files is empty.
+            'prompt': 'Mode: `BRAINSTORM`. Concept: a CLI that counts lines.\n\nEGM required reads:\n',
         }
         MockProvider.parent_steps = ['dispatch', 'resume'] if scenario == 'guarded' else ['dispatch']
         attacks = [
@@ -218,7 +227,9 @@ def run(scenario: str, source: Path, binary: Path, output: Path, port: int) -> d
             ('read', {'path': str(project / 'alias.md')}),
             ('read', {'path': str(project / 'reference.md')}),
             ('read', {'path': str(outside / 'private.md')}),
+            ('read', {'path': str(outside / 'absent.md')}),
             ('read', {'path': str(project / 'sub' / 'notes.md')}),
+            ('glob', {'path': 'outside-dir', 'pattern': '**/*.md'}),
             ('write', {'path': str(project / 'written.md'), 'content': 'write probe'}),
             ('shell', {'command': f'touch {project / "shell-ran"}'}),
             ('skill', {'id': 'egm-review'}),
@@ -301,12 +312,17 @@ def run(scenario: str, source: Path, binary: Path, output: Path, port: int) -> d
                 'env_symlink_denied': outcome(by_path.get(str(project / 'alias.md'))) == 'denied',
                 'outside_symlink_denied': outcome(by_path.get(str(project / 'reference.md'))) == 'denied',
                 'outside_read_denied': outcome(by_path.get(str(outside / 'private.md'))) == 'denied',
+                'outside_absent_read_denied': outcome(by_path.get(str(outside / 'absent.md'))) == 'denied',
+                'outside_symlink_glob_blocked': by_name.get('glob', {}).get('status') == 'error',
                 'write_shell_skill_unavailable': all(outcome(by_name.get(n)) == 'unavailable'
                                                      for n in ('write', 'shell', 'skill')),
                 'no_mutation': not (project / 'written.md').exists() and not (project / 'shell-ran').exists(),
             })
         if scenario == 'guarded':
+            second_result = json.dumps([m for m in parent_requests[2]['messages'] if m.get('role') == 'tool']) \
+                if len(parent_requests) > 2 else ''
             checks['resume_starts_fresh_child'] = len(children) == 2 and None not in children and children[0] != children[1]
+            checks['brainstorm_completed'] = len(calls) == 2 and calls[1].get('status') == 'completed' and FINDINGS in second_result
             checks['nested_agents_md_read_allowed'] = outcome(by_path.get(str(project / 'sub' / 'notes.md'))) == 'completed'
         if scenario == 'incomplete':
             checks.update({
