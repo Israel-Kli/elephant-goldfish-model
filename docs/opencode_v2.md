@@ -45,7 +45,7 @@ To uninstall, stop sessions and remove only this candidate directory and its env
 ## Paths and dispatch
 
 Use the absolute bundle root in the generated prompt.
-Resolve `agents/`, `resources/`, and `docs/` against that root, and `references/` against the canonical skill directory after resolving its alias.
+Resolve `agents/`, `resources/`, and `docs/` against that root, and `references/` against the skill's directory under `skills/`.
 Resolve user files and outputs against the project directory. Never substitute project files for bundled personas.
 
 Dispatch reviewers directly from `egm` with the `subagent` tool. Set `agent` to the persona's canonical frontmatter name and supply `description` and `prompt`.
@@ -78,13 +78,16 @@ The generated configuration denies `subagent` to `egm` for every reviewer. The `
 
 For each dispatch from `egm`, the guard:
 
-- rejects a prompt without the `EGM required reads:` line, or with a listed file that is missing, empty, outside the project and the bundle, or a `.env` file;
+- rejects a prompt without the `EGM required reads:` line, or with a listed file that is missing, empty, outside the project and the bundle, a `.env` file, or an `AGENTS.md` file;
 - removes `sessionID` and `background`;
 - replaces the result with an `EGM: incomplete review` notice unless the persona and every listed file were read in full, judged by the line ranges OpenCode reports for each read.
 
 For each reviewer request, the guard keeps the reviewer's own system prompt and the date and environment sources, drops every other instruction source (global, project, and nested `AGENTS.md`, configured instructions, MCP and skill guidance) and every synthetic message, and limits tools to `read` and `glob`.
 It checks reviewer reads on the resolved file, so symlinks to `.env` files or out of the project and the bundle are denied, even when project configuration or session rules allow more.
+Reviewers cannot read `AGENTS.md` files, which would otherwise bring the stripped project instructions back.
 A `glob` path outside the project and the bundle is rejected.
+
+For `egm` itself, the generated rules ask before reading `.env` files or leaving the project. When a path inside the project resolves through a symlink to either, the guard asks as well.
 
 Reviewers deny `grep`: its permission resource is the search pattern, so read rules cannot apply to it.
 The primary agent asks before writes and shell commands, allows `question`, and allows only `egm-*` skills.
@@ -95,6 +98,8 @@ Tool rules and plugin hooks are not process or filesystem isolation.
 
 - Coverage is per line. OpenCode shortens lines longer than 2,000 characters.
 - The orchestrator chooses the required-read list; live runs must check it against the canonical stage.
+- Other project files can still carry instructions; the guard blocks only `AGENTS.md`, the file OpenCode loads as instructions.
+- The orchestrator's `grep` searches file contents without the `.env` read rules.
 - Hard links, races between a permission check and the read, and plugins that run after the guard are out of its reach.
 - The guard relies on OpenCode 2.2.6 details such as `metadata.experimental.instructions` and the read output header. Keep the version pinned and rerun the probe before changing it.
 

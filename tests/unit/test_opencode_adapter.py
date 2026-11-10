@@ -108,7 +108,9 @@ def test_v2_install_uses_native_config_and_guard(tmp_path: Path) -> None:
         assert hashlib.sha256((destination / relative).read_bytes()).hexdigest() == digest
     # Keys from the V1 schema would mix formats inside one document.
     assert not {"agent", "command", "autoupdate", "permission"} & set(config)
-    assert config["skills"] == [str(destination / "skills")]
+    # V2 takes skill IDs from directory names, so it needs no alias links.
+    assert config["skills"] == [str(destination / "bundle/skills")]
+    assert not (destination / "skills").exists()
 
     personas = {
         ADAPTER["name"](bundle / "agents" / f"{filename}.md"): str(bundle / "agents" / f"{filename}.md")

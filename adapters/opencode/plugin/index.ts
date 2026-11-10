@@ -7,7 +7,7 @@
 // so without the plugin no reviewer can start.
 
 import { readFileSync, realpathSync } from "node:fs"
-import { isAbsolute, relative, resolve as resolvePath, sep } from "node:path"
+import { basename, isAbsolute, relative, resolve as resolvePath, sep } from "node:path"
 
 type Part = { type: string; text?: string; metadata?: any }
 type Rule = { action: string; resource: string; effect: string }
@@ -29,6 +29,9 @@ const within = (path: string, root: string) => path === root || path.startsWith(
 // The installer's read rules deny *.env and *.env.*, then allow *.env.example. Matching ignores
 // case here because macOS and Windows file systems usually do.
 const secret = (path: string) => /\.env($|\.)/i.test(path) && !/\.env\.example$/i.test(path)
+// OpenCode injects AGENTS.md as instructions; the guard strips the injected copy, and reviewers
+// must not fetch it themselves.
+const instructions = (path: string) => basename(path).toLowerCase() === "agents.md"
 
 // OpenCode 2.2.6 starts read output with "Read file <path>, lines A-B", counting only the lines
 // it returned, or "Read file <path>, 0 lines".
@@ -117,6 +120,8 @@ export default {
       const root = roots.find((candidate) => within(target, candidate))
       return !!root && !secret(relative(root, target))
     }
+    const reviewerMayRead = (requested: string, directory: string, roots: string[]) =>
+      allowedFile(requested, directory, roots) && !instructions(requested) && !instructions(real(requested) ?? requested)
 
     const isolate = (strict: boolean) => async (event: any) => {
       if (!isReviewer(event.agent)) return
@@ -192,8 +197,8 @@ export default {
       const directory = await directoryOf(event.sessionID)
       const roots = await rootsOf(event.sessionID)
       for (const path of reads) {
-        if (!real(path) || !allowedFile(path, directory, roots) || lineCount(path) === 0) {
-          throw new Error(`EGM: required read is missing, empty, or outside the project and the EGM bundle: ${path}`)
+        if (!real(path) || !reviewerMayRead(path, directory, roots) || lineCount(path) === 0) {
+          throw new Error(`EGM: required read is missing, empty, an AGENTS.md file, or outside the project and the EGM bundle: ${path}`)
         }
       }
       // Every review is a fresh foreground child: never resume a reviewer session.
@@ -252,22 +257,39 @@ export default {
         event.message = "EGM reviewers can only be dispatched by the egm agent."
         return
       }
+      // The orchestrator's rules ask before .env files and outside reads, but they match the path as
+      // written; ask too when a path inside the project resolves through a symlink to either.
+      if (event.agent === primary && event.action === "read" && event.effect === "allow") {
+        const directory = await directoryOf(event.sessionID)
+        const roots = await rootsOf(event.sessionID)
+        const escapes = resources.some((resource) => {
+          const requested = resolve(resource, directory)
+          const inside = [directory, ctx.location?.project?.directory, bundle].some((root) => root && within(requested, root))
+          return inside && !allowedFile(requested, directory, roots)
+        })
+        if (escapes) {
+          event.effect = "ask"
+          event.message = "This path resolves through a symlink to a .env file or outside the project."
+        }
+        return
+      }
       if (!isReviewer(event.agent)) return
       let permitted = event.action === "glob"
       if (event.action === "external_directory") {
         permitted = resources.every((resource) => {
-          const target = real(resource.replace(/\/\*$/, ""))
-          return !!target && within(target, bundleRoot)
+          // A directory that does not exist cannot leak; let the read report it as missing.
+          const directory = resource.replace(/\/\*$/, "")
+          return within(real(directory) ?? resolvePath(directory), bundleRoot)
         })
       }
       if (event.action === "read") {
         const directory = await directoryOf(event.sessionID)
         const roots = await rootsOf(event.sessionID)
-        permitted = resources.every((resource) => allowedFile(resolve(resource, directory), directory, roots))
+        permitted = resources.every((resource) => reviewerMayRead(resolve(resource, directory), directory, roots))
       }
       if (!permitted) {
         event.effect = "deny"
-        event.message = "EGM reviewers may only read the project and the EGM bundle, excluding .env files."
+        event.message = "EGM reviewers may only read the project and the EGM bundle, excluding .env and AGENTS.md files."
       }
     })
   },

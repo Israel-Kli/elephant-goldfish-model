@@ -43,7 +43,7 @@ SCENARIOS = ('guarded', 'incomplete', 'undeclared', 'unguarded', 'widened')
 
 class MockProvider(BaseHTTPRequestHandler):
     requests: list[dict[str, Any]] = []
-    parent_steps: list[str] = []
+    parent_steps: list[str | tuple[str, dict[str, Any]]] = []
     child_steps: list[tuple[str, dict[str, Any]]] = []
     dispatch: dict[str, Any] = {}
     resume_dispatch: dict[str, Any] = {}
@@ -86,7 +86,9 @@ class MockProvider(BaseHTTPRequestHandler):
             self.wfile.write(('data: ' + json.dumps(event) + '\n\n').encode())
         self.wfile.write(b'data: [DONE]\n\n')
 
-    def parent_call(self, step: str, messages: list[dict[str, Any]]) -> tuple[str, dict[str, Any]]:
+    def parent_call(self, step: str | tuple[str, dict[str, Any]], messages: list[dict[str, Any]]) -> tuple[str, dict[str, Any]]:
+        if isinstance(step, tuple):
+            return step
         if step == 'dispatch':
             return 'subagent', self.dispatch
         # A resume attempt, sent as a brainstorm dispatch: reuse the first child's session in the background.
@@ -221,7 +223,11 @@ def run(scenario: str, source: Path, binary: Path, output: Path, port: int) -> d
             # A brainstorm concept lives in the prompt, so its list of required files is empty.
             'prompt': 'Mode: `BRAINSTORM`. Concept: a CLI that counts lines.\n\nEGM required reads:\n',
         }
-        MockProvider.parent_steps = ['dispatch', 'resume'] if scenario == 'guarded' else ['dispatch']
+        # In the guarded run the orchestrator first reads both symlinks, as live runs showed it does.
+        MockProvider.parent_steps = [
+            ('read', {'path': str(project / 'alias.md')}), ('read', {'path': str(project / 'reference.md')}),
+            'dispatch', 'resume',
+        ] if scenario == 'guarded' else ['dispatch']
         attacks = [
             ('read', {'path': str(project / '.env')}),
             ('read', {'path': str(project / 'alias.md')}),
@@ -229,6 +235,8 @@ def run(scenario: str, source: Path, binary: Path, output: Path, port: int) -> d
             ('read', {'path': str(outside / 'private.md')}),
             ('read', {'path': str(outside / 'absent.md')}),
             ('read', {'path': str(project / 'sub' / 'notes.md')}),
+            ('read', {'path': str(project / 'AGENTS.md')}),
+            ('read', {'path': str(install / 'bundle' / 'agents' / 'missing' / 'absent.md')}),
             ('glob', {'path': 'outside-dir', 'pattern': '**/*.md'}),
             ('write', {'path': str(project / 'written.md'), 'content': 'write probe'}),
             ('shell', {'command': f'touch {project / "shell-ran"}'}),
@@ -291,8 +299,19 @@ def run(scenario: str, source: Path, binary: Path, output: Path, port: int) -> d
         records = tool_records(exports.get('child0', {}))
         by_path = {str(r.get('input', {}).get('path')): r for r in records if r['name'] == 'read'}
         by_name = {r['name']: r for r in records if r['name'] != 'read'}
-        first_result = json.dumps([m for m in parent_requests[1]['messages'] if m.get('role') == 'tool']) \
-            if len(parent_requests) > 1 else ''
+        parent_records = {str(r.get('input', {}).get('path')): r for r in tool_records(exports.get('parent', {}))
+                          if r['name'] == 'read'}
+
+        def result_of(step: int) -> str:
+            # The mock advances one parent step per tool result, so step N's result is the last of N + 1.
+            for request in parent_requests:
+                results = [m for m in request['messages'] if m.get('role') == 'tool']
+                if len(results) == step + 1:
+                    return json.dumps(results[-1])
+            return ''
+
+        dispatch_at = MockProvider.parent_steps.index('dispatch')
+        first_result, second_result = result_of(dispatch_at), result_of(dispatch_at + 1)
         leaked = sorted(key for key in ('parent', 'global', 'project', 'nested', 'configured')
                         if any(markers[key] in json.dumps(r) for r in child_requests))
         secrets_seen = sorted(key for key in ('secret', 'outside')
@@ -313,17 +332,21 @@ def run(scenario: str, source: Path, binary: Path, output: Path, port: int) -> d
                 'outside_symlink_denied': outcome(by_path.get(str(project / 'reference.md'))) == 'denied',
                 'outside_read_denied': outcome(by_path.get(str(outside / 'private.md'))) == 'denied',
                 'outside_absent_read_denied': outcome(by_path.get(str(outside / 'absent.md'))) == 'denied',
+                'agents_md_read_denied': outcome(by_path.get(str(project / 'AGENTS.md'))) == 'denied',
+                'missing_bundle_file_not_denied': outcome(by_path.get(
+                    str(install / 'bundle' / 'agents' / 'missing' / 'absent.md'))).startswith('error'),
                 'outside_symlink_glob_blocked': by_name.get('glob', {}).get('status') == 'error',
                 'write_shell_skill_unavailable': all(outcome(by_name.get(n)) == 'unavailable'
                                                      for n in ('write', 'shell', 'skill')),
                 'no_mutation': not (project / 'written.md').exists() and not (project / 'shell-ran').exists(),
             })
         if scenario == 'guarded':
-            second_result = json.dumps([m for m in parent_requests[2]['messages'] if m.get('role') == 'tool']) \
-                if len(parent_requests) > 2 else ''
             checks['resume_starts_fresh_child'] = len(children) == 2 and None not in children and children[0] != children[1]
             checks['brainstorm_completed'] = len(calls) == 2 and calls[1].get('status') == 'completed' and FINDINGS in second_result
             checks['nested_agents_md_read_allowed'] = outcome(by_path.get(str(project / 'sub' / 'notes.md'))) == 'completed'
+            # A non-interactive run rejects what would otherwise prompt.
+            checks['parent_symlink_reads_asked'] = all(outcome(parent_records.get(str(project / name))) == 'denied'
+                                                       for name in ('alias.md', 'reference.md'))
         if scenario == 'incomplete':
             checks.update({
                 'incomplete_notice': 'EGM: incomplete review' in first_result

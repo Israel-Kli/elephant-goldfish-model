@@ -68,12 +68,17 @@ def install(destination: Path, interface: str = "v1") -> Path:
     )
     context = f"Read {guide} first. " + location
     personas = {name(bundle / "agents" / f"{r}.md"): (r, bundle / "agents" / f"{r}.md") for r in REVIEWERS}
-    skills = destination / "skills"
-    skills.mkdir()
+    # V2 takes skill IDs from directory names, so it uses the bundle directly; V1 gets alias links.
+    skills = destination / "skills" if interface == "v1" else bundle / "skills"
+    if interface == "v1":
+        skills.mkdir()
     commands = {}
     for skill in sorted((bundle / "skills").glob("*/SKILL.md")):
         skill_name = name(skill)
-        (skills / skill_name).symlink_to(skill.parent, target_is_directory=True)
+        if interface == "v1":
+            (skills / skill_name).symlink_to(skill.parent, target_is_directory=True)
+        elif skill.parent.name != skill_name:
+            raise ValueError(f"Skill directory must match its canonical name for V2: {skill.parent}")
         commands[skill_name] = {
             "description": f"Run {skill_name} (experimental)",
             "agent": "egm",
@@ -188,7 +193,8 @@ def v2_config(bundle, skills, plugin, commands, personas, location, reviewer_pro
             # must not turn into a partial read.
             "system": location + reviewer_prompt.format(persona=persona)
             + " Read the persona and every file listed under \"EGM required reads\" from line 1 to the end, "
-            "even when your review scope is a line range; pass offset only to continue after a truncated page.",
+            "even when your review scope is a line range; pass offset only to continue after a truncated page. "
+            "Do not read AGENTS.md files: they hold instructions for other agents, not review input.",
         }
     agents["egm"] = {
         "description": "EGM orchestrator (experimental OpenCode V2)",
