@@ -216,10 +216,12 @@ export default {
       if (event.status !== "completed") return
       const child = event.result?.metadata?.sessionID
       const ranges = new Map<string, [number, number][]>()
+      let finalText = ""
       if (child) {
         const directory = await directoryOf(child)
         for (const message of await ctx.session.context({ sessionID: child })) {
           if (message.type !== "assistant") continue
+          finalText = (message.content ?? []).filter((part: any) => part.type === "text").map((part: any) => part.text ?? "").join("")
           for (const part of message.content ?? []) {
             if (part.type !== "tool" || part.name !== "read" || part.state?.status !== "completed") continue
             const target = real(resolve(String(part.state.input?.path ?? ""), directory))
@@ -235,15 +237,18 @@ export default {
         const total = lineCount(target)
         return total === 0 || !covers(ranges.get(target) ?? [], total)
       }).map(([, path]) => path)
-      if (!missing.length) return
-      const notice =
-        `EGM: incomplete review. ${agent} did not read these required files in full: ${missing.join(", ")}. ` +
-        "Do not use this review; report it as incomplete."
+      // A reviewer that ends without text has not reviewed, even after reading everything.
+      const reasons = [
+        ...(missing.length ? [`did not read these required files in full: ${missing.join(", ")}`] : []),
+        ...(finalText.trim() ? [] : ["returned no review text"]),
+      ]
+      if (!reasons.length) return
+      const notice = `EGM: incomplete review. ${agent} ${reasons.join(" and ")}. Do not use this review; report it as incomplete.`
       event.result = {
         ...event.result,
         output: { ...event.result?.output, output: notice },
         content: [{ type: "text", text: notice }],
-        metadata: { ...event.result?.metadata, egmMissingReads: missing },
+        metadata: { ...event.result?.metadata, egmIncomplete: reasons },
       }
     })
 

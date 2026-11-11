@@ -80,7 +80,7 @@ For each dispatch from `egm`, the guard:
 
 - rejects a prompt without the `EGM required reads:` line, or with a listed file that is missing, empty, outside the project and the bundle, a `.env` file, or an `AGENTS.md` file;
 - removes `sessionID` and `background`;
-- replaces the result with an `EGM: incomplete review` notice unless the persona and every listed file were read in full, judged by the line ranges OpenCode reports for each read.
+- replaces the result with an `EGM: incomplete review` notice unless the persona and every listed file were read in full, judged by the line ranges OpenCode reports for each read, and the reviewer ended with review text.
 
 For each reviewer request, the guard keeps the reviewer's own system prompt and the date and environment sources, drops every other instruction source (global, project, and nested `AGENTS.md`, configured instructions, MCP and skill guidance) and every synthetic message, and limits tools to `read` and `glob`.
 It checks reviewer reads on the resolved file, so symlinks to `.env` files or out of the project and the bundle are denied, even when project configuration or session rules allow more.

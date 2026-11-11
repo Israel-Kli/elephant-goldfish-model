@@ -38,7 +38,7 @@ STANDARD = 'resources/document_standards/zoom-out-standard.md'
 PARENT_PROMPT = 'Dispatch reviewers directly'
 CHILD_SYSTEM = 'Do not write reports or delegate'
 FINDINGS = 'SCRIPTED_FINDINGS'
-SCENARIOS = ('guarded', 'incomplete', 'undeclared', 'unguarded', 'widened')
+SCENARIOS = ('guarded', 'incomplete', 'empty', 'undeclared', 'unguarded', 'widened')
 
 
 class MockProvider(BaseHTTPRequestHandler):
@@ -46,6 +46,7 @@ class MockProvider(BaseHTTPRequestHandler):
     parent_steps: list[str | tuple[str, dict[str, Any]]] = []
     child_steps: list[tuple[str, dict[str, Any]]] = []
     dispatch: dict[str, Any] = {}
+    child_final = FINDINGS
     resume_dispatch: dict[str, Any] = {}
     calls = itertools.count(1)
     lock = threading.Lock()
@@ -68,7 +69,7 @@ class MockProvider(BaseHTTPRequestHandler):
             done = sum(1 for message in messages[last:] if message.get('role') == 'tool')
             if done < len(self.child_steps):
                 call = self.child_steps[done]
-        delta: dict[str, Any] = {'role': 'assistant', 'content': FINDINGS}
+        delta: dict[str, Any] = {'role': 'assistant', 'content': self.child_final if role(request) == 'child' else FINDINGS}
         finish = 'stop'
         if call:
             delta, finish = {'role': 'assistant', 'tool_calls': [{
@@ -242,11 +243,14 @@ def run(scenario: str, source: Path, binary: Path, output: Path, port: int) -> d
             ('shell', {'command': f'touch {project / "shell-ran"}'}),
             ('skill', {'id': 'egm-review'}),
         ]
+        # Live runs saw a reviewer read everything and then end without any text.
+        MockProvider.child_final = '' if scenario == 'empty' else FINDINGS
         MockProvider.child_steps = {
             # The target is read by a relative path to check identity matching.
             'guarded': [('read', {'path': str(persona)}), ('read', {'path': 'docs/target.md'}),
                         ('read', {'path': str(standard)}), *attacks],
             'incomplete': [('read', {'path': str(persona), 'limit': 1}), ('read', {'path': str(target)})],
+            'empty': [('read', {'path': str(persona)}), ('read', {'path': str(target)}), ('read', {'path': str(standard)})],
             'widened': [('read', {'path': str(persona)}), ('read', {'path': str(target)}),
                         ('read', {'path': str(standard)}), *attacks],
         }.get(scenario, [('read', {'path': str(persona)})])
@@ -352,6 +356,11 @@ def run(scenario: str, source: Path, binary: Path, output: Path, port: int) -> d
                 'incomplete_notice': 'EGM: incomplete review' in first_result
                                      and str(persona) in first_result and str(standard) in first_result,
                 'findings_withheld': FINDINGS not in first_result,
+            })
+        if scenario == 'empty':
+            checks.update({
+                'required_reads_completed': all(outcome(by_path.get(str(p))) == 'completed' for p in (persona, target, standard)),
+                'empty_review_rejected': 'EGM: incomplete review' in first_result and 'returned no review text' in first_result,
             })
         if scenario in ('undeclared', 'unguarded'):
             expected = 'EGM required reads' if scenario == 'undeclared' else 'Permission denied'
