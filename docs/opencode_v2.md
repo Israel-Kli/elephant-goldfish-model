@@ -29,14 +29,14 @@ The configuration contains seven commands, eight reviewers, the `egm` primary ag
 Start OpenCode from the project directory with the candidate configuration:
 
 ```sh
-OPENCODE_CONFIG=/absolute/egm-opencode-v2-candidate/opencode.json opencode --agent egm
+OPENCODE_CONFIG=/absolute/egm-opencode-v2-candidate/opencode.json opencode
 ```
 
 OpenCode loads configuration and plugins from the reviewed project, and project configuration outranks `OPENCODE_CONFIG`.
 For an untrusted repository or a verification run, also set `OPENCODE_DISABLE_PROJECT_CONFIG=1`, which skips project configuration, plugins, skills, and the project `AGENTS.md`.
 
 Model calls require separate user authorization.
-Select `egm` before native skill use. The guard denies reviewer dispatch from other agents.
+The configuration makes `egm` the default agent; the 2.2.6 terminal UI has no `--agent` flag. Keep `egm` selected for EGM workflows. The guard denies reviewer dispatch from other agents.
 For review text, use an ordinary message rather than a slash command, for example `Use the egm-review skill to review /absolute/path/design.md.`
 OpenCode evaluates shell blocks (an exclamation mark followed by a command in backticks) in slash-command arguments before agent tool permissions apply, whether or not the template contains `$ARGUMENTS`.
 Do not paste untrusted review material into slash-command arguments.
