@@ -10,6 +10,7 @@ Maintainer approval, live workflows, and isolation verification remain pending u
 ## Install
 
 Use Python 3.10+ and a POSIX filesystem with symbolic links.
+Windows is unverified: the probe needs symbolic links, and hard links, which a Windows run without symlink privilege falls back to, are outside the guard's reach.
 Select a fixed candidate commit before installation and keep the installation at its original path.
 The installer copies the complete canonical resource trees and the guard plugin. It does not change global or project configuration and refuses an existing destination.
 
